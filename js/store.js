@@ -225,6 +225,7 @@
     if (data.session) {
       state.user = data.user;
       state.session = data.session;
+      await loadData();          // تحميل الملف الشخصي والتصنيفات (فارغة للمستخدم الجديد)
     }
     return { user: data.user, session: data.session, needsConfirmation: needsConfirmation };
   }
@@ -256,6 +257,7 @@
 
     state.user = data.user;
     state.session = data.session;
+    await loadData();
     return data.user;
   }
 

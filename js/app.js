@@ -1264,6 +1264,14 @@
     $$('.nav-item').forEach((a) => a.classList.toggle('is-active', a.dataset.view === 'all'));
     renderUser();
     renderNotes();
+
+    // مزامنة نهائية مع القاعدة (بعد الدخول أو استعادة الجلسة)
+    try {
+      await Store.loadData();
+      renderNotes();
+    } catch (err) {
+      toast((err && err.message) || 'تعذّر تحميل الملاحظات', 'error');
+    }
     el.searchInput.focus();
   }
 
