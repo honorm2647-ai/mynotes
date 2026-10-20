@@ -618,6 +618,18 @@
         return { configured: true, locked: false, user: null };
       }
 
+      // التحقق من الخادم أن المستخدم ما زال موجوداً — الجلسة المحلية قد تكون
+      // صالحة التوقيع لكن صاحبها حُذف من قاعدة البيانات.
+      try {
+        const { data: verified, error: vErr } = await sb.auth.getUser(data.session.access_token);
+        if (vErr || !verified || !verified.user) {
+          try { await sb.auth.signOut({ scope: 'local' }); } catch (e) {}
+          return { configured: true, locked: false, user: null, sessionInvalid: true };
+        }
+      } catch (e) {
+        // انقطاع مؤقت في الشبكة: نكمل بالجلسة المحلية
+      }
+
       state.user = data.session.user;
       state.session = data.session;
 

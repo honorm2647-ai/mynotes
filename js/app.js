@@ -1308,6 +1308,8 @@
           toast(res.error.message || 'تعذّر تحميل البيانات', 'error');
         }
         await enterApp();
+      } else if (res && res.sessionInvalid) {
+        toast('انتهت صلاحية الجلسة. سجّل الدخول من جديد.', 'info');
       }
     } catch (e) {
       console.error(e);
