@@ -62,6 +62,14 @@
     strengthBox: $('#strengthBox'),
     strengthFill: $('#strengthFill'),
     strengthText: $('#strengthText'),
+    configWarning: $('#configWarning'),
+    configWarningText: $('#configWarningText'),
+    verifyPanel: $('#verifyPanel'),
+    verifyTitle: $('#verifyTitle'),
+    verifyText: $('#verifyText'),
+    verifyMail: $('#verifyMail'),
+    resendBtn: $('#resendBtn'),
+    backToLoginBtn: $('#backToLoginBtn'),
 
     sidebar: $('#sidebar'),
     sidebarScrim: $('#sidebarScrim'),
@@ -155,18 +163,10 @@
     return new Intl.DateTimeFormat('ar-EG-u-nu-latn', { day: 'numeric', month: 'short', year: 'numeric' }).format(d);
   }
 
-  function fmtBytes(bytes) {
-    if (bytes < 1024) return bytes + ' بايت';
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / 1048576).toFixed(2) + ' MB';
-  }
-
   function words(text) {
     const t = String(text || '').trim();
     return t ? t.split(/\s+/).length : 0;
   }
-
-  function uid(prefix) { return Store.newId(prefix || 'n'); }
 
   /* ======================================================================
      التنبيهات (Toasts)
@@ -240,6 +240,7 @@
      ====================================================================== */
   function setMode(mode) {
     UI.mode = mode;
+    showVerifyPanel(false);
     el.tabs.dataset.mode = mode;
     el.tabLogin.classList.toggle('is-active', mode === 'login');
     el.tabRegister.classList.toggle('is-active', mode === 'register');
@@ -256,6 +257,24 @@
     clearFieldErrors();
     hideAlert();
   }
+
+  /* ---- لوحة تأكيد البريد الإلكتروني ---- */
+  function showVerifyPanel(show, email) {
+    el.verifyPanel.hidden = !show;
+    el.authForm.hidden = show;
+    el.tabs.style.display = show ? 'none' : '';
+    if (show) {
+      el.verifyMail.textContent = email || el.email.value.trim();
+      el.verifyTitle.textContent = 'تحقّق من بريدك الإلكتروني';
+      el.verifyText.textContent = 'أرسلنا رابط تفعيل إلى بريدك. افتح الرابط لتفعيل الحساب ثم عد لتسجيل الدخول.';
+    }
+  }
+
+  function showConfigWarning(message) {
+    el.configWarningText.textContent = message;
+    el.configWarning.hidden = false;
+  }
+  function hideConfigWarning() { el.configWarning.hidden = true; }
 
   function clearFieldErrors() {
     $$('.field-error').forEach((p) => { p.textContent = ''; p.classList.remove('show'); });
@@ -306,13 +325,27 @@
 
   function updateStrength() {
     const val = el.password.value;
-    const score = NoteCrypto.strengthOf(val);
+    const score = strengthOf(val);
     const labels = ['', 'ضعيفة', 'متوسطة', 'جيدة', 'قوية جداً'];
     const colors = ['#ef4444', '#f59e0b', '#eab308', '#22c55e', '#10b981'];
     el.strengthFill.style.width = (score / 4 * 100) + '%';
     el.strengthFill.style.background = colors[score] || colors[0];
     el.strengthText.textContent = val ? labels[score] : '—';
     el.strengthText.style.color = val ? (colors[score] || colors[0]) : '';
+  }
+
+  /** تقدير قوة كلمة المرور — مؤشر مساعدة للمستخدم فقط.
+      (التجزئة الفعلية تتم على خوادم Supabase Auth) */
+  function strengthOf(password) {
+    if (!password) return 0;
+    let score = 0;
+    if (password.length >= 8) score++;
+    if (password.length >= 12) score++;
+    if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score++;
+    if (/\d/.test(password)) score++;
+    if (/[^A-Za-z0-9]/.test(password)) score++;
+    if (password.length < 6) score = Math.min(score, 1);
+    return Math.min(score, 4);
   }
 
   async function handleAuthSubmit(e) {
@@ -324,40 +357,53 @@
     el.submitBtn.disabled = true;
 
     try {
-      const remember = el.rememberMe.checked;
+      const email = el.email.value.trim();
+      const password = el.password.value;
+
       if (UI.mode === 'register') {
-        const user = await Store.register({
+        const res = await Store.register({
           name: el.fullName.value.trim(),
-          email: el.email.value.trim(),
-          password: el.password.value
-        }, remember);
-        toast('تم إنشاء حسابك بنجاح، أهلاً بك ' + user.name, 'success');
+          email: email,
+          password: password
+        });
+
+        if (res.needsConfirmation) {
+          // Supabase يطلب تأكيد البريد قبل منح الجلسة
+          showVerifyPanel(true, email);
+          el.password.value = '';
+          toast('أرسلنا رابط تفعيل إلى بريدك الإلكتروني', 'info');
+          return;
+        }
+        toast('تم إنشاء حسابك بنجاح، أهلاً بك ' + Store.displayName, 'success');
       } else {
-        const user = await Store.login({
-          email: el.email.value.trim(),
-          password: el.password.value
-        }, remember);
-        toast('مرحباً بعودتك، ' + user.name, 'success');
+        await Store.login({ email: email, password: password });
+        toast('مرحباً بعودتك، ' + Store.displayName, 'success');
       }
+
       el.authForm.reset();
       el.rememberMe.checked = true;
-      enterApp();
+      await enterApp();
     } catch (err) {
-      const code = err && err.message;
-      if (code === 'EMAIL_EXISTS') {
+      const reason = err && err.reason;
+      const msg = err && err.message ? err.message : 'حدث خطأ غير متوقع. حاول مرة أخرى.';
+
+      if (reason === 'EMAIL_EXISTS') {
         fieldError('email', 'هذا البريد مسجّل بالفعل');
         setMode('login');
         showAlert('يوجد حساب بهذا البريد الإلكتروني. سجّل الدخول بدلاً من ذلك.');
-      } else if (code === 'NO_USER') {
-        fieldError('email', 'لا يوجد حساب بهذا البريد الإلكتروني');
-      } else if (code === 'BAD_PASSWORD') {
-        fieldError('password', 'كلمة المرور غير صحيحة');
-      } else if (code === 'CRYPTO_MISMATCH') {
-        fieldError('password', 'تعذّر التحقق من كلمة المرور في هذا المتصفح. استخدم نفس المتصفح الذي أنشأت به الحساب.');
-      } else if (code === 'STORAGE_FULL') {
-        showAlert('تعذّر الحفظ: مساحة التخزين ممتلئة. صدّر ملاحظاتك ثم احذف بيانات المتصفح.');
+      } else if (reason === 'BAD_PASSWORD') {
+        fieldError('password', 'البريد الإلكتروني أو كلمة المرور غير صحيحة');
+      } else if (reason === 'NOT_CONFIRMED') {
+        showVerifyPanel(true, el.email.value.trim());
+        showAlert('لم يتم تأكيد بريدك بعد. افتح رسالة التأكيد ثم أعد المحاولة.');
+      } else if (reason === 'EMAIL_RATE_LIMIT') {
+        showAlert('تم تجاوز حد إرسال رسائل البريد مؤقتاً. انتظر قليلاً ثم أعد المحاولة.');
+      } else if (reason === 'NETWORK') {
+        showAlert('تعذّر الاتصال بالخادم. تحقّق من اتصالك بالإنترنت.');
+      } else if (reason === 'NO_TABLES') {
+        showAlert('جداول قاعدة البيانات غير موجودة. نفّذ ملف supabase-schema.sql في لوحة تحكم Supabase.');
       } else {
-        showAlert('حدث خطأ غير متوقع. حاول مرة أخرى.');
+        showAlert(msg);
       }
     } finally {
       el.submitBtn.classList.remove('loading');
@@ -540,19 +586,19 @@
   }
 
   function updateStorage() {
-    const bytes = Store.usageBytes();
-    const quota = 5 * 1024 * 1024;
-    const pct = Math.min(100, (bytes / quota) * 100);
-    el.storageText.textContent = fmtBytes(bytes);
-    el.storageFill.style.width = Math.max(pct, 1) + '%';
+    const count = (Store.notes || []).length;
+    const online = !!Store.user;
+    el.storageText.textContent = online ? count + ' ملاحظة' : 'غير متصل';
+    const pct = Math.min(100, (count / 40) * 100);
+    el.storageFill.style.width = (online ? Math.max(pct, 2) : 0) + '%';
   }
 
   function renderUser() {
     const u = Store.user;
     if (!u) return;
-    el.userName.textContent = u.name;
+    el.userName.textContent = Store.displayName;
     el.userEmail.textContent = u.email;
-    el.userAvatar.textContent = (u.name || u.email).trim().charAt(0) || 'م';
+    el.userAvatar.textContent = (Store.displayName || u.email).trim().charAt(0) || 'م';
   }
 
   /* ======================================================================
@@ -646,97 +692,82 @@
       return;
     }
 
-    const notes = (Store.notes || []).slice();
-    const stamp = Store.now();
-    let note;
+    const payload = {
+      title: title, body: body, tags: tags, color: color, categoryId: categoryId,
+      pinned: UI.editingPinned, favorite: UI.editingFavorite, archived: UI.editingArchived
+    };
 
-    if (UI.editingId) {
-      const idx = notes.findIndex((n) => n.id === UI.editingId);
-      if (idx !== -1) {
-        note = Object.assign({}, notes[idx], {
-          title: title, body: body, tags: tags, color: color,
-          categoryId: categoryId,
-          pinned: UI.editingPinned,
-          favorite: UI.editingFavorite,
-          archived: UI.editingArchived,
-          updatedAt: stamp
-        });
-        notes[idx] = note;
+    el.saveNoteBtn.disabled = true;
+    try {
+      if (UI.editingId) {
+        await Store.updateNote(UI.editingId, payload);
+      } else {
+        await Store.createNote(payload);
       }
+      closeEditor();
+      renderNotes();
+      toast(wasNew ? 'تم إنشاء الملاحظة' : 'تم تحديث الملاحظة', 'success');
+    } catch (err) {
+      toast(err && err.message ? err.message : 'تعذّر حفظ الملاحظة', 'error');
+    } finally {
+      el.saveNoteBtn.disabled = false;
     }
-    if (!note) {
-      note = {
-        id: uid('n'),
-        title: title,
-        body: body,
-        tags: tags,
-        color: color,
-        categoryId: categoryId,
-        pinned: UI.editingPinned,
-        favorite: UI.editingFavorite,
-        archived: UI.editingArchived,
-        trashed: false,
-        createdAt: stamp,
-        updatedAt: stamp
-      };
-      notes.unshift(note);
-    }
-
-    const ok = await Store.saveNotes(notes);
-    if (!ok) {
-      toast('تعذّر الحفظ — مساحة التخزين ممتلئة', 'error');
-      return;
-    }
-    closeEditor();
-    renderNotes();
-    toast(wasNew ? 'تم إنشاء الملاحظة' : 'تم تحديث الملاحظة', 'success');
   }
 
   async function togglePin(id) {
-    const notes = (Store.notes || []).map((n) =>
-      n.id === id ? Object.assign({}, n, { pinned: !n.pinned, updatedAt: Store.now() }) : n
-    );
-    await Store.saveNotes(notes);
-    if (UI.editingId === id) { UI.editingPinned = !UI.editingPinned; syncEditorToggles(); }
-    renderNotes();
+    const note = (Store.notes || []).find((n) => n.id === id);
+    if (!note) return;
+    try {
+      await Store.updateNote(id, { pinned: !note.pinned });
+      if (UI.editingId === id) { UI.editingPinned = !note.pinned; syncEditorToggles(); }
+      renderNotes();
+    } catch (err) {
+      toast(err.message || 'تعذّر تحديث الملاحظة', 'error');
+    }
   }
 
   async function toggleFav(id) {
-    const notes = (Store.notes || []).map((n) =>
-      n.id === id ? Object.assign({}, n, { favorite: !n.favorite, updatedAt: Store.now() }) : n
-    );
-    await Store.saveNotes(notes);
-    if (UI.editingId === id) { UI.editingFavorite = !UI.editingFavorite; syncEditorToggles(); }
-    renderNotes();
+    const note = (Store.notes || []).find((n) => n.id === id);
+    if (!note) return;
+    try {
+      await Store.updateNote(id, { favorite: !note.favorite });
+      if (UI.editingId === id) { UI.editingFavorite = !note.favorite; syncEditorToggles(); }
+      renderNotes();
+    } catch (err) {
+      toast(err.message || 'تعذّر تحديث الملاحظة', 'error');
+    }
   }
 
   async function trashNote(id) {
-    const note = (Store.notes || []).find((n) => n.id === id);
-    if (!note) return;
-    const notes = (Store.notes || []).map((n) =>
-      n.id === id ? Object.assign({}, n, { trashed: true, deletedAt: Store.now(), updatedAt: Store.now() }) : n
-    );
-    await Store.saveNotes(notes);
-    if (UI.editingId === id) closeEditor();
-    renderNotes();
-    toast('نُقلت الملاحظة إلى سلة المحذوفات', 'info');
+    try {
+      await Store.updateNote(id, { trashed: true, deletedAt: Store.now() });
+      if (UI.editingId === id) closeEditor();
+      renderNotes();
+      toast('نُقلت الملاحظة إلى سلة المحذوفات', 'info');
+    } catch (err) {
+      toast(err.message || 'تعذّر نقل الملاحظة', 'error');
+    }
   }
 
   async function restoreNote(id) {
-    const notes = (Store.notes || []).map((n) =>
-      n.id === id ? Object.assign({}, n, { trashed: false, deletedAt: null, updatedAt: Store.now() }) : n
-    );
-    await Store.saveNotes(notes);
-    renderNotes();
-    toast('تمت استعادة الملاحظة', 'success');
+    try {
+      await Store.updateNote(id, { trashed: false, deletedAt: null });
+      renderNotes();
+      toast('تمت استعادة الملاحظة', 'success');
+    } catch (err) {
+      toast(err.message || 'تعذّرت استعادة الملاحظة', 'error');
+    }
   }
 
   async function deleteForever(id) {
-    const notes = (Store.notes || []).filter((n) => n.id !== id);
-    await Store.saveNotes(notes);
-    if (UI.editingId === id) closeEditor();
-    renderNotes();
-    toast('تم حذف الملاحظة نهائياً', 'info');
+    try {
+      await Store.deleteNote(id);
+      if (UI.editingId === id) closeEditor();
+      renderNotes();
+      toast('تم حذف الملاحظة نهائياً', 'info');
+    } catch (err) {
+      toast(err.message || 'تعذّر حذف الملاحظة', 'error');
+    }
   }
 
   /* ======================================================================
@@ -751,13 +782,15 @@
     });
     if (!name) return;
     const clean = String(name).trim();
-    if (!clean) { el.promptError.textContent = 'الرجاء إدخال اسم'; el.promptError.classList.add('show'); return; }
-    const cats = (Store.categories || []).slice();
-    const color = COLORS[cats.length % COLORS.length].hex;
-    cats.push({ id: uid('c'), name: clean, color: color, createdAt: Store.now() });
-    await Store.saveCategories(cats);
-    renderNotes();
-    toast('تم إنشاء التصنيف «' + clean + '»', 'success');
+    if (!clean) return;
+    const color = COLORS[(Store.categories || []).length % COLORS.length].hex;
+    try {
+      await Store.createCategory({ name: clean, color: color });
+      renderNotes();
+      toast('تم إنشاء التصنيف «' + clean + '»', 'success');
+    } catch (err) {
+      toast(err.message || 'تعذّر إنشاء التصنيف', 'error');
+    }
   }
 
   async function editCategory(id) {
@@ -772,10 +805,13 @@
     if (name === null) return;
     const clean = String(name).trim();
     if (!clean) return;
-    const cats = (Store.categories || []).map((c) => (c.id === id ? Object.assign({}, c, { name: clean }) : c));
-    await Store.saveCategories(cats);
-    renderNotes();
-    toast('تم تحديث اسم التصنيف', 'success');
+    try {
+      await Store.updateCategory(id, { name: clean });
+      renderNotes();
+      toast('تم تحديث اسم التصنيف', 'success');
+    } catch (err) {
+      toast(err.message || 'تعذّر تحديث التصنيف', 'error');
+    }
   }
 
   async function deleteCategory(id) {
@@ -790,18 +826,40 @@
       okText: 'حذف'
     });
     if (!ok) return;
-    const cats = (Store.categories || []).filter((c) => c.id !== id);
-    const notes = (Store.notes || []).map((n) => (n.categoryId === id ? Object.assign({}, n, { categoryId: null }) : n));
-    await Store.saveCategories(cats);
-    await Store.saveNotes(notes);
-    if (UI.view === 'category' && UI.categoryId === id) { UI.view = 'all'; UI.categoryId = null; }
-    renderNotes();
-    toast('تم حذف التصنيف', 'info');
+    try {
+      await Store.deleteCategory(id);
+      if (UI.view === 'category' && UI.categoryId === id) { UI.view = 'all'; UI.categoryId = null; }
+      renderNotes();
+      toast('تم حذف التصنيف', 'info');
+    } catch (err) {
+      toast(err.message || 'تعذّر حذف التصنيف', 'error');
+    }
   }
 
   /* ======================================================================
      التصدير والاستيراد
      ====================================================================== */
+  async function editProfileName() {
+    const current = Store.displayName;
+    const name = await askPrompt({
+      title: 'تعديل الاسم المعروض',
+      text: 'هذا الاسم يظهر في أعلى التطبيق فقط، ولا يغيّر بريدك الإلكتروني.',
+      value: current,
+      placeholder: 'اسمك',
+      okText: 'حفظ'
+    });
+    if (name === null) return;
+    const clean = String(name).trim();
+    if (!clean) return;
+    try {
+      await Store.updateProfile({ display_name: clean });
+      renderUser();
+      toast('تم تحديث الاسم', 'success');
+    } catch (err) {
+      toast((err && err.message) || 'تعذّر تحديث الاسم', 'error');
+    }
+  }
+
   function exportData() {
     try {
       const blob = new Blob([Store.exportData()], { type: 'application/json;charset=utf-8' });
@@ -828,7 +886,7 @@
         renderNotes();
         toast('تم استيراد ' + count + ' ملاحظة', 'success');
       } catch (e) {
-        toast('الملف غير صالح', 'error');
+        toast((e && e.message) || 'الملف غير صالح', 'error');
       }
     };
     reader.onerror = () => toast('تعذّر قراءة الملف', 'error');
@@ -888,6 +946,30 @@
     el.tabRegister.addEventListener('click', () => setMode('register'));
     el.authForm.addEventListener('submit', handleAuthSubmit);
     el.password.addEventListener('input', updateStrength);
+
+    /* --- تأكيد البريد --- */
+    el.backToLoginBtn.addEventListener('click', () => {
+      showVerifyPanel(false);
+      setMode('login');
+    });
+
+    el.resendBtn.addEventListener('click', async () => {
+      const email = el.verifyMail.textContent.trim();
+      if (!email) return;
+      el.resendBtn.disabled = true;
+      const label = $('.btn-label', el.resendBtn) || el.resendBtn;
+      const original = label.textContent;
+      label.textContent = 'جارٍ الإرسال…';
+      try {
+        await Store.resendConfirmation(email);
+        toast('تم إرسال رابط تفعيل جديد إلى ' + email, 'success');
+      } catch (err) {
+        toast((err && err.message) || 'تعذّر إرسال الرابط', 'error');
+      } finally {
+        el.resendBtn.disabled = false;
+        label.textContent = original;
+      }
+    });
 
     document.addEventListener('click', (e) => {
       const sw = e.target.closest('[data-switch-mode]');
@@ -1072,6 +1154,7 @@
       if (action === 'export') exportData();
       else if (action === 'import') el.importFile.click();
       else if (action === 'lock') lockApp();
+      else if (action === 'profile') editProfileName();
     });
 
     el.importFile.addEventListener('change', (e) => {
@@ -1084,12 +1167,12 @@
     el.logoutBtn.addEventListener('click', async () => {
       const ok = await askConfirm({
         title: 'تسجيل الخروج',
-        text: 'ستحتاج إلى كلمة المرور للدخول مرة أخرى. ملاحظاتك تبقى محفوظة بأمان.',
+        text: 'ستحتاج إلى كلمة المرور للدخول مرة أخرى. ملاحظاتك محفوظة بأمان في سحابة Supabase.',
         okText: 'تسجيل الخروج',
         danger: false
       });
       if (!ok) return;
-      Store.logout();
+      await Store.logout();
       closeEditor();
       el.appScreen.hidden = true;
       el.authScreen.hidden = false;
@@ -1159,17 +1242,18 @@
      القفل والدخول
      ====================================================================== */
   async function lockApp() {
+    const email = Store.user ? Store.user.email : '';
     await Store.lock();
     closeEditor();
     el.appScreen.hidden = true;
     el.authScreen.hidden = false;
     setMode('login');
-    el.email.value = Store.user ? Store.user.email : '';
+    el.email.value = email;
     el.password.focus();
     toast('تم قفل التطبيق — أدخل كلمة المرور للمتابعة', 'info');
   }
 
-  function enterApp() {
+  async function enterApp() {
     el.authScreen.hidden = true;
     el.appScreen.hidden = false;
     UI.view = 'all';
@@ -1187,27 +1271,39 @@
      الإقلاع
      ====================================================================== */
   async function init() {
+    setMode('login');
+    bindEvents();
+
+    // تهيئة عميل Supabase
+    const ok = Store.init();
+    if (!ok) {
+      showConfigWarning('تعذّر تحميل مكتبة Supabase أو إعدادات الاتصال. تحقّق من وجود اتصال بالإنترنت، ومن صحّة القيم في js/config.js.');
+      el.submitBtn.disabled = true;
+    }
+
     const settings = Store.getSettings();
     applyTheme(settings.theme || systemTheme());
     applyLayout(settings.view || 'grid');
     UI.sort = settings.sort || 'updated';
     el.sortSelect.value = UI.sort;
 
-    setMode('login');
-    bindEvents();
+    if (!ok) return;
 
+    // استعادة جلسة حالية إن وُجدت
     try {
       const res = await Store.boot();
-      if (res && !res.locked) {
-        enterApp();
-        toast('مرحباً بعودتك، ' + res.user.name, 'success');
-      } else if (res && res.locked) {
-        el.email.value = res.user.email;
-        showAlert('الجلسة مقفلة. أدخل كلمة المرور للمتابعة.');
-        setTimeout(() => el.password.focus(), 120);
+      if (res && res.user) {
+        if (res.noTables) {
+          showConfigWarning('جداول قاعدة البيانات غير موجودة. نفّذ ملف supabase-schema.sql في لوحة تحكم Supabase (SQL Editor).');
+        }
+        if (res.error) {
+          toast(res.error.message || 'تعذّر تحميل البيانات', 'error');
+        }
+        await enterApp();
       }
     } catch (e) {
       console.error(e);
+      toast('تعذّر الاتصال بقاعدة البيانات', 'error');
     }
   }
 

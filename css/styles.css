@@ -140,6 +140,50 @@ svg { width: 20px; height: 20px; flex-shrink: 0; }
 /* ==========================================================================
    Auth Screen
    ========================================================================== */
+
+/* تحذير إعداد الاتصال */
+.config-warning {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 11px 13px;
+  margin-bottom: 16px;
+  border-radius: var(--r-sm);
+  font-size: 12.8px;
+  font-weight: 500;
+  line-height: 1.6;
+  background: var(--warn-bg);
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
+  animation: riseIn .3s var(--ease-out);
+}
+.config-warning svg { width: 17px; height: 17px; margin-top: 2px; flex-shrink: 0; }
+
+/* لوحة تأكيد البريد */
+.verify-panel { text-align: center; animation: riseIn .35s var(--ease-out); }
+.verify-icon {
+  width: 58px; height: 58px;
+  margin: 4px auto 16px;
+  border-radius: var(--r-full);
+  display: grid; place-items: center;
+  background: var(--brand-50);
+  color: var(--brand-600);
+}
+[data-theme="dark"] .verify-icon { background: rgba(99, 102, 241, .16); color: var(--brand-300); }
+.verify-icon svg { width: 28px; height: 28px; }
+.verify-panel h3 { font-size: 18px; margin-bottom: 8px; }
+.verify-panel p { font-size: 13.5px; color: var(--muted); line-height: 1.75; margin-bottom: 14px; }
+.verify-mail {
+  font-size: 13px !important;
+  font-weight: 600;
+  color: var(--text-soft) !important;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+  margin-bottom: 16px !important;
+  word-break: break-all;
+}
+.verify-panel .btn { margin-bottom: 9px; }
+
 .auth-screen {
   position: relative;
   min-height: 100vh;

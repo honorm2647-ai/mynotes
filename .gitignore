@@ -3,9 +3,15 @@
 .env.txt
 *.env.txt
 supabase.env.txt
+supabase/
 secrets.json
 *.pem
 *.key
+
+# مفاتيح Supabase — لا تُرفع أبداً
+sb_publishable_*
+sb_secret_*
+service_role*
 
 # ملفات النظام
 .DS_Store

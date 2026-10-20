@@ -1,401 +1,657 @@
 /* ==========================================================================
-   Store — طبقة البيانات (localStorage)
-   - عزل كامل لكل مستخدم (مساحة مفاتيح منفصلة)
-   - تشفير AES-GCM لمحتوى الملاحظات، المفتاح مُشتق من كلمة مرور المستخدم
+   Store — طبقة البيانات فوق Supabase
+   ─────────────────────────────────────────────────────────────────────────
+   • المصادقة: Supabase Auth (تجزئة كلمة المرور على الخادم، لا تُخزَّن أبداً)
+   • البيانات: جداول notes / categories / profiles مع حماية RLS
+   • كل عملية كتابة تتركب على هوية المستخدم (auth.uid()) عبر سياسات RLS
+   • لا يوجد أي تخزين محلي للبيانات — التخزين المحلي للإعدادات فقط
    ========================================================================== */
 (function (global) {
   'use strict';
 
-  const NS = 'mynotes.v1';
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
+  const CFG = global.APP_CONFIG || {};
+  const T = CFG.tables || {};
+  const LS_SETTINGS = 'mynotes.settings.v1';
 
-  const K = {
-    users:     NS + '.users',            // سجل المستخدمين
-    remember:  NS + '.remember',         // تذكّرني: userId + المفتاح المشفّر
-    session:   NS + '.session',          // الجلسة الحالية (sessionStorage)
-    settings:  NS + '.settings',         // إعدادات عامة (مظهر/عرض)
-    user: (uid, part) => NS + '.u.' + uid + '.' + part
+  /* ======================================================================
+     الحالة
+     ====================================================================== */
+  const state = {
+    user: null,        // مستخدم Supabase (session.user)
+    session: null,     // جلسة Supabase
+    profile: null,     // صف الملف الشخصي
+    notes: [],         // نسخة في الذاكرة (مصدر العرض)
+    categories: [],
+    loading: false,
+    configured: false,
+    migrated: 0,
+    lastError: null
   };
 
-  /* ---------- أدوات ---------- */
+  let sb = null;
+
+  /* ======================================================================
+     أدوات
+     ====================================================================== */
+  function nowISO() { return new Date().toISOString(); }
+
   function safeParse(raw, fallback) {
     if (!raw) return fallback;
     try { return JSON.parse(raw); } catch (e) { return fallback; }
   }
 
-  function readLS(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
-  function writeLS(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } }
-  function removeLS(k) { try { localStorage.removeItem(k); } catch (e) {} }
-  function readSS(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
-  function writeSS(k, v) { try { sessionStorage.setItem(k, v); return true; } catch (e) { return false; } }
-  function removeSS(k) { try { sessionStorage.removeItem(k); } catch (e) {} }
-
-  function b64(buf) {
-    const bytes = new Uint8Array(buf);
-    let s = '';
-    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-    return global.btoa(s);
+  function readLocalSettings() {
+    try { return JSON.parse(localStorage.getItem(LS_SETTINGS)) || {}; } catch (e) { return {}; }
   }
-  function unb64(str) {
-    const bin = global.atob(str);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
+  function writeLocalSettings(obj) {
+    try { localStorage.setItem(LS_SETTINGS, JSON.stringify(obj)); } catch (e) {}
   }
 
-  function uid(prefix) {
-    const bytes = new Uint8Array(9);
-    if (global.crypto && global.crypto.getRandomValues) {
-      global.crypto.getRandomValues(bytes);
-    } else {
-      for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  /** يحوّل صف قاعدة البيانات إلى نموذج التطبيق (camelCase) */
+  function toApp(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      userId: row.user_id,
+      title: row.title || '',
+      body: row.body || '',
+      tags: Array.isArray(row.tags) ? row.tags.slice() : [],
+      color: row.color || '#6366f1',
+      categoryId: row.category_id || null,
+      pinned: !!row.pinned,
+      favorite: !!row.favorite,
+      archived: !!row.archived,
+      trashed: !!row.trashed,
+      deletedAt: row.deleted_at || null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  /** يحوّل نموذج التطبيق إلى صف قاعدة البيانات (snake_case) — حقول محددة فقط */
+  function toRow(patch) {
+    const row = {};
+    const map = {
+      title: 'title',
+      body: 'body',
+      color: 'color',
+      pinned: 'pinned',
+      favorite: 'favorite',
+      archived: 'archived',
+      trashed: 'trashed',
+      deletedAt: 'deleted_at',
+      categoryId: 'category_id'
+    };
+    Object.keys(map).forEach((k) => {
+      if (Object.prototype.hasOwnProperty.call(patch, k)) row[map[k]] = patch[k];
+    });
+    if (Object.prototype.hasOwnProperty.call(patch, 'tags')) {
+      row.tags = (patch.tags || []).map((t) => String(t).slice(0, 40));
     }
-    const rand = global.NoteCrypto ? global.NoteCrypto.toHex(bytes) : String(Date.now());
-    return (prefix || 'id') + '_' + rand;
+    return row;
   }
 
-  function now() { return new Date().toISOString(); }
+  /** ترجمة أخطاء Supabase إلى رسائل عربية مفهومة */
+  function translateError(err) {
+    if (!err) return 'حدث خطأ غير متوقع.';
+    const code = err.code || '';
+    const msg = String(err.message || '').toLowerCase();
 
-  /* ---------- حالة داخلية ---------- */
-  const state = {
-    user: null,          // المستخدم الحالي
-    aesKey: null,        // مفتاح تشفير المحتوى
-    notes: [],
-    categories: [],
-    secure: false        // هل التشفير فعّال؟
-  };
-
-  /* ---------- المستخدمون ---------- */
-  function loadUsers() { return safeParse(readLS(K.users), {}); }
-  function saveUsers(map) { return writeLS(K.users, JSON.stringify(map)); }
-
-  function normalizeEmail(email) { return String(email || '').trim().toLowerCase(); }
-
-  function findUserByEmail(email) {
-    const map = loadUsers();
-    const target = normalizeEmail(email);
-    const found = Object.keys(map).find((id) => map[id].email === target);
-    return found ? map[found] : null;
+    if (code === 'over_email_send_rate_limit' || msg.includes('rate limit')) {
+      return 'تم تجاوز حد إرسال رسائل البريد المؤقت. حاول بعد قليل.';
+    }
+    if (code === 'user_already_exists' || msg.includes('already registered') || msg.includes('already been registered')) {
+      return 'هذا البريد مسجّل بالفعل. سجّل الدخول بدلاً من ذلك.';
+    }
+    if (code === 'email_not_confirmed' || msg.includes('email not confirmed')) {
+      return 'لم يتم تأكيد بريدك الإلكتروني بعد. افتح رسالة التأكيد التي أرسلناها.';
+    }
+    if (code === 'invalid_credentials' || msg.includes('invalid login credentials')) {
+      return 'البريد الإلكتروني أو كلمة المرور غير صحيحة.';
+    }
+    if (msg.includes('password should be at least')) {
+      return 'كلمة المرور يجب أن تكون 6 أحرف على الأقل.';
+    }
+    if (msg.includes('email address') && msg.includes('invalid')) {
+      return 'صيغة البريد الإلكتروني غير صحيحة.';
+    }
+    if (msg.includes('rate limit') && msg.includes('email')) {
+      return 'تم تجاوز حد إرسال رسائل البريد. حاول بعد قليل.';
+    }
+    if (msg.includes('failed to fetch') || msg.includes('network') || msg.includes('fetch')) {
+      return 'تعذّر الاتصال بالخادم. تحقّق من اتصالك بالإنترنت.';
+    }
+    if (code === 'PGRST205' || msg.includes('could not find the table')) {
+      return 'لم يتم إنشاء جداول قاعدة البيانات بعد. نفّذ ملف supabase-schema.sql في لوحة تحكم Supabase.';
+    }
+    if (code === '42501' || msg.includes('row-level security') || msg.includes('violates row-level security')) {
+      return 'لا تملك صلاحية على هذه العملية.';
+    }
+    return err.message || 'حدث خطأ غير متوقع.';
   }
 
-  /* ---------- اشتقاق المفاتيح ---------- */
-  function subtleOk() {
-    return !!(global.crypto && global.crypto.subtle &&
-      typeof global.crypto.subtle.deriveKey === 'function');
+  /** خطأ مُغلّف يحمل كود reason لعرض رسالة دقيقة في الواجهة */
+  function fail(reason, message) {
+    const e = new Error(message || reason);
+    e.reason = reason;
+    return e;
   }
 
-  async function deriveAesKey(password, saltHex) {
-    const salt = global.NoteCrypto.fromHex(saltHex);
-    const keyMaterial = await global.crypto.subtle.importKey(
-      'raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']
-    );
-    return global.crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt: salt, iterations: 210000, hash: 'SHA-256' },
-      keyMaterial,
-      { name: 'AES-GCM', length: 256 },
-      true,                       // قابل للتصدير (لحفظ "تذكّرني")
-      ['encrypt', 'decrypt']
-    );
+  function isNetworkError(err) {
+    const m = String((err && err.message) || '').toLowerCase();
+    return m.includes('fetch') || m.includes('network') || m.includes('timeout') || m.includes('failed to fetch');
   }
 
-  async function importAesKey(rawB64) {
-    return global.crypto.subtle.importKey(
-      'raw', unb64(rawB64), { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
-    );
-  }
-
-  async function exportAesKey(key) {
-    return b64(await global.crypto.subtle.exportKey('raw', key));
-  }
-
-  /* ---------- تشفير المحتوى ---------- */
-  async function encryptJSON(obj) {
-    if (!state.secure || !state.aesKey) return { plain: JSON.stringify(obj) };
-    const iv = global.crypto.getRandomValues(new Uint8Array(12));
-    const data = enc.encode(JSON.stringify(obj));
-    const ct = await global.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, state.aesKey, data);
-    return { iv: b64(iv), ct: b64(ct) };
-  }
-
-  async function decryptJSON(record) {
-    if (!record) return null;
-    if (record.plain) return JSON.parse(record.plain);
-    if (!state.aesKey) return null;
+  /* ======================================================================
+     تنظيف بيانات النسخة الأولى (localStorage)
+     تنقل إعدادات العرض، وتُحذف بقية البيانات القديمة (كانت مشفّرة بمفتاح
+     محلي لم يعد له معنى بعد التحويل إلى Supabase).
+     ====================================================================== */
+  function migrateLegacy() {
     try {
-      const iv = unb64(record.iv);
-      const ct = unb64(record.ct);
-      const pt = await global.crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, state.aesKey, ct);
-      return JSON.parse(dec.decode(pt));
+      let legacySettings = null;
+      const stale = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k || k.indexOf('mynotes.v1.') !== 0) continue;
+        if (k === 'mynotes.v1.settings') legacySettings = safeParse(localStorage.getItem(k), null);
+        else stale.push(k);
+      }
+      stale.forEach((k) => { try { localStorage.removeItem(k); } catch (e) {} });
+
+      if (legacySettings) {
+        const current = readLocalSettings();
+        const merged = Object.assign({}, legacySettings, current);
+        writeLocalSettings(merged);
+      }
+      // إعدادات النسخة الأولى استُخدمت — تُحذف أيضاً
+      try { localStorage.removeItem('mynotes.v1.settings'); } catch (e) {}
+      return stale.length;
     } catch (e) {
+      if (global.console && console.warn) console.warn('[mynotes] تعذّر تنظيف بيانات النسخة الأولى:', e);
+      return -1;
+    }
+  }
+
+  /* ======================================================================
+     تهيئة العميل
+     ====================================================================== */
+  function initClient() {
+    const cfg = CFG.supabase || {};
+    state.migrated = migrateLegacy();
+    if (!global.supabase || !cfg.url || !cfg.publishableKey) {
+      state.configured = false;
+      return null;
+    }
+    try {
+      sb = global.supabase.createClient(cfg.url, cfg.publishableKey, {
+        auth: {
+          persistSession: CFG.auth.persistSession !== false,
+          autoRefreshToken: CFG.auth.autoRefreshToken !== false,
+          detectSessionInUrl: true,
+          storageKey: CFG.auth.storageKey || 'mynotes.auth.v1'
+        },
+        db: { schema: 'public' },
+        global: { headers: { 'x-application-name': 'mynotes' } }
+      });
+      state.configured = true;
+      return sb;
+    } catch (e) {
+      state.configured = false;
       return null;
     }
   }
 
-  async function writePart(uid, part, payload) {
-    const record = await encryptJSON(payload);
-    return writeLS(K.user(uid, part), JSON.stringify(record));
+  /* ======================================================================
+     المصادقة
+     ====================================================================== */
+  async function register({ name, email, password }) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لم يتم إعداد الاتصال بقاعدة البيانات.');
+
+    const { data, error } = await sb.auth.signUp({
+      email: String(email).trim().toLowerCase(),
+      password: password,
+      options: { data: { display_name: String(name || '').trim() } }
+    });
+
+    if (error) {
+      const msg = translateError(error);
+      const e = fail(mapAuthReason(error, msg), msg);
+      throw e;
+    }
+
+    // بدون جلسة = Supabase يطلب تأكيد البريد
+    const needsConfirmation = !data.session;
+    if (data.session) {
+      state.user = data.user;
+      state.session = data.session;
+    }
+    return { user: data.user, session: data.session, needsConfirmation: needsConfirmation };
   }
 
-  async function readPart(uid, part, fallback) {
-    const raw = readLS(K.user(uid, part));
-    if (!raw) return fallback;
-    const record = safeParse(raw, null);
-    if (!record) return fallback;
-    const val = await decryptJSON(record);
-    return val == null ? fallback : val;
+  function mapAuthReason(error, msg) {
+    const code = error.code || '';
+    const m = String(error.message || '').toLowerCase();
+    if (code === 'user_already_exists' || m.includes('already registered')) return 'EMAIL_EXISTS';
+    if (code === 'email_not_confirmed' || m.includes('email not confirmed')) return 'NOT_CONFIRMED';
+    if (code === 'invalid_credentials' || m.includes('invalid login credentials')) return 'BAD_PASSWORD';
+    if (code === 'over_email_send_rate_limit') return 'EMAIL_RATE_LIMIT';
+    if (m.includes('email rate limit') || (m.includes('rate limit') && m.includes('email'))) return 'EMAIL_RATE_LIMIT';
+    if (isNetworkError(error)) return 'NETWORK';
+    return 'AUTH_ERROR';
   }
 
-  /* ---------- جلسة العمل ---------- */
-  function setSession(userId, remember) {
-    removeSS(K.session);
-    if (remember) {
-      removeLS(K.session);
-      writeLS(K.session, JSON.stringify({ userId: userId, t: now() }));
-    } else {
-      writeSS(K.session, JSON.stringify({ userId: userId, t: now() }));
+  async function login({ email, password }) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لم يتم إعداد الاتصال بقاعدة البيانات.');
+
+    const { data, error } = await sb.auth.signInWithPassword({
+      email: String(email).trim().toLowerCase(),
+      password: password
+    });
+
+    if (error) {
+      const msg = translateError(error);
+      throw fail(mapAuthReason(error, msg), msg);
+    }
+
+    state.user = data.user;
+    state.session = data.session;
+    return data.user;
+  }
+
+  async function resendConfirmation(email) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لم يتم إعداد الاتصال بقاعدة البيانات.');
+    const { error } = await sb.auth.resend({
+      type: 'signup',
+      email: String(email).trim().toLowerCase()
+    });
+    if (error) {
+      const msg = translateError(error);
+      throw fail(mapAuthReason(error, msg), msg);
+    }
+    return true;
+  }
+
+  async function logout() {
+    if (sb) { try { await sb.auth.signOut(); } catch (e) {} }
+    state.user = null;
+    state.session = null;
+    state.profile = null;
+    state.notes = [];
+    state.categories = [];
+  }
+
+  /** قفل التطبيق: يمسح الجلسة من المتصفح (يتطلب كلمة المرور للعودة) */
+  async function lock() {
+    if (sb) { try { await sb.auth.signOut({ scope: 'local' }); } catch (e) {} }
+    state.user = null;
+    state.session = null;
+    state.notes = [];
+    state.categories = [];
+  }
+
+  /* ======================================================================
+     تحميل البيانات
+     ====================================================================== */
+  async function loadData() {
+    if (!sb || !state.user) return;
+    const uid = state.user.id;
+    state.loading = true;
+
+    try {
+      const [notesRes, catsRes, profRes] = await Promise.all([
+        sb.from(T.notes || 'notes')
+          .select('*')
+          .eq('user_id', uid)
+          .order('updated_at', { ascending: false })
+          .limit(CFG.app.pageSize),
+        sb.from(T.categories || 'categories')
+          .select('*')
+          .eq('user_id', uid)
+          .order('created_at', { ascending: true }),
+        sb.from(T.profiles || 'profiles')
+          .select('*')
+          .eq('id', uid)
+          .maybeSingle()
+      ]);
+
+      if (notesRes.error) throw fail(mapDbReason(notesRes.error), translateError(notesRes.error));
+      if (catsRes.error) throw fail(mapDbReason(catsRes.error), translateError(catsRes.error));
+
+      state.notes = (notesRes.data || []).map(toApp);
+      state.categories = (catsRes.data || []).map((c) => ({
+        id: c.id,
+        name: c.name,
+        color: c.color,
+        createdAt: c.created_at
+      }));
+
+      // الملف الشخصي: يُنشأ تلقائياً عبر trigger، لكن نضمن وجوده
+      if (profRes.data) {
+        state.profile = profRes.data;
+      } else {
+        const { data, error } = await sb.from(T.profiles || 'profiles').upsert({
+          id: uid,
+          display_name: (state.user.user_metadata && state.user.user_metadata.display_name) || '',
+          theme: readLocalSettings().theme || 'light',
+          layout: readLocalSettings().view || 'grid',
+          sort_order: readLocalSettings().sort || 'updated'
+        }, { onConflict: 'id' }).select().single();
+        if (!error && data) state.profile = data;
+      }
+    } finally {
+      state.loading = false;
     }
   }
 
-  function getSession() {
-    const ss = safeParse(readSS(K.session), null);
-    if (ss && ss.userId) return ss;
-    const ls = safeParse(readLS(K.session), null);
-    if (ls && ls.userId) return ls;
-    return null;
+  /* ======================================================================
+     CRUD — الملاحظات
+     ====================================================================== */
+  async function createNote(data) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+    const payloadRow = toRow(data);
+    payloadRow.user_id = state.user.id;
+
+    // ملاحظة: .single() تُعيد صفاً واحداً ككائن (وليس مصفوفة)
+    const { data: inserted, error } = await sb.from(T.notes || 'notes').insert(payloadRow).select().single();
+    if (error) throw fail(mapDbReason(error), translateError(error));
+
+    const note = toApp(inserted);
+    if (!note) throw fail('DB_ERROR', 'تعذّر إنشاء الملاحظة.');
+    state.notes.unshift(note);
+    return note;
   }
 
-  function clearSession() {
-    removeSS(K.session);
-    removeLS(K.session);
-    removeLS(K.remember);
-    state.user = null;
-    state.aesKey = null;
-    state.notes = [];
-    state.categories = [];
-    state.secure = false;
+  async function updateNote(id, patch) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+
+    const before = state.notes.find((n) => n.id === id);
+    // تحديث متفائل في الذاكرة
+    if (before) {
+      state.notes = state.notes.map((n) => (n.id === id ? Object.assign({}, n, patch, { updatedAt: nowISO() }) : n));
+    }
+
+    const { data: updated, error } = await sb.from(T.notes || 'notes')
+      .update(toRow(patch))
+      .eq('id', id)
+      .eq('user_id', state.user.id)
+      .select()
+      .single();
+
+    if (error) {
+      if (before) state.notes = state.notes.map((n) => (n.id === id ? before : n));   // تراجع
+      throw fail(mapDbReason(error), translateError(error));
+    }
+
+    const note = toApp(updated);
+    if (!note) throw fail('DB_ERROR', 'تعذّر تحديث الملاحظة.');
+    state.notes = state.notes.map((n) => (n.id === id ? note : n));
+    return note;
   }
 
-  /* ---------- واجهة Store ---------- */
+  async function deleteNote(id) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+
+    const before = state.notes;
+    state.notes = state.notes.filter((n) => n.id !== id);
+
+    const { error } = await sb.from(T.notes || 'notes')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', state.user.id);
+
+    if (error) {
+      state.notes = before;   // تراجع
+      throw fail(mapDbReason(error), translateError(error));
+    }
+    return true;
+  }
+
+  /** حذف مجموعة ملاحظات (استيراد) */
+  async function insertNotes(list) {
+    if (!sb || !list.length) return [];
+    const rows = list.map((n) => {
+      const row = toRow(n);
+      row.user_id = state.user.id;
+      return row;
+    });
+    const { data, error } = await sb.from(T.notes || 'notes').insert(rows).select();
+    if (error) throw fail(mapDbReason(error), translateError(error));
+    const notes = (data || []).map(toApp);
+    state.notes = notes.concat(state.notes);
+    return notes;
+  }
+
+  /* ======================================================================
+     CRUD — التصنيفات
+     ====================================================================== */
+  async function createCategory({ name, color }) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+    const { data: inserted, error } = await sb.from(T.categories || 'categories')
+      .insert({ user_id: state.user.id, name: name, color: color || '#6366f1' })
+      .select().single();
+    if (error) throw fail(mapDbReason(error), translateError(error));
+    const cat = { id: inserted.id, name: inserted.name, color: inserted.color, createdAt: inserted.created_at };
+    state.categories.push(cat);
+    return cat;
+  }
+
+  async function updateCategory(id, patch) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+    const row = {};
+    if (patch.name !== undefined) row.name = patch.name;
+    if (patch.color !== undefined) row.color = patch.color;
+
+    const { data: updated, error } = await sb.from(T.categories || 'categories')
+      .update(row)
+      .eq('id', id)
+      .eq('user_id', state.user.id)
+      .select().single();
+    if (error) throw fail(mapDbReason(error), translateError(error));
+
+    const cat = { id: updated.id, name: updated.name, color: updated.color, createdAt: updated.created_at };
+    state.categories = state.categories.map((c) => (c.id === id ? cat : c));
+    return cat;
+  }
+
+  async function deleteCategory(id) {
+    if (!sb) throw fail('NOT_CONFIGURED', 'لا يوجد اتصال بقاعدة البيانات.');
+    const before = state.categories;
+    state.categories = state.categories.filter((c) => c.id !== id);
+
+    const { error } = await sb.from(T.categories || 'categories')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', state.user.id);
+    if (error) {
+      state.categories = before;
+      throw fail(mapDbReason(error), translateError(error));
+    }
+    //_notes_ تُفقد تصنيفها تلقائياً عبر ON DELETE SET NULL
+    state.notes = state.notes.map((n) => (n.categoryId === id ? Object.assign({}, n, { categoryId: null }) : n));
+    return true;
+  }
+
+  /* ======================================================================
+     الملف الشخصي والإعدادات
+     ====================================================================== */
+  async function updateProfile(patch) {
+    if (!sb || !state.user) return null;
+    const row = {};
+    if (patch.display_name !== undefined) row.display_name = patch.display_name;
+    if (patch.theme !== undefined) row.theme = patch.theme;
+    if (patch.layout !== undefined) row.layout = patch.layout;
+    if (patch.sort !== undefined) row.sort_order = patch.sort;
+
+    const { data, error } = await sb.from(T.profiles || 'profiles')
+      .upsert(Object.assign({ id: state.user.id }, row), { onConflict: 'id' })
+      .select().single();
+    if (error) throw fail(mapDbReason(error), translateError(error));
+    state.profile = data;
+    return data;
+  }
+
+  function getSettings() {
+    const local = readLocalSettings();
+    return Object.assign({ theme: null, view: 'grid', sort: 'updated' }, local);
+  }
+
+  /** يحفظ الإعدادات محلياً (فوري) ويزامنها مع السحابة (لاحقاً) */
+  function saveSettings(patch) {
+    const next = Object.assign(getSettings(), patch || {});
+    writeLocalSettings(next);
+    if (state.user) {
+      const remote = {};
+      if (patch.theme !== undefined) remote.theme = patch.theme;
+      if (patch.view !== undefined) remote.layout = patch.view;
+      if (patch.sort !== undefined) remote.sort = patch.sort;
+      if (Object.keys(remote).length) {
+        sb.from(T.profiles || 'profiles')
+          .upsert(Object.assign({ id: state.user.id }, remote), { onConflict: 'id' })
+          .then(({ error }) => { if (error) console.warn('تعذّرت مزامنة الإعدادات:', error.message); })
+          .catch(() => {});
+      }
+    }
+    return next;
+  }
+
+  function mapDbReason(error) {
+    const code = error.code || '';
+    const m = String(error.message || '').toLowerCase();
+    if (code === 'PGRST205' || m.includes('could not find the table')) return 'NO_TABLES';
+    if (code === '42501' || m.includes('row-level security')) return 'FORBIDDEN';
+    if (isNetworkError(error)) return 'NETWORK';
+    if (code === '23505' || m.includes('duplicate key')) return 'DUPLICATE';
+    if (code === '23503' || m.includes('foreign key')) return 'FK_ERROR';
+    return 'DB_ERROR';
+  }
+
+  /* ======================================================================
+     التصدير والاستيراد
+     ====================================================================== */
+  function exportData() {
+    return JSON.stringify({
+      app: 'ملاحظاتي',
+      version: 2,
+      exportedAt: nowISO(),
+      user: { name: displayName(), email: state.user ? state.user.email : '' },
+      categories: state.categories,
+      notes: state.notes
+    }, null, 2);
+  }
+
+  async function importData(json) {
+    const data = (function () { try { return JSON.parse(json); } catch (e) { return null; } })();
+    if (!data || !Array.isArray(data.notes)) throw fail('BAD_FILE', 'الملف غير صالح.');
+
+    const incoming = data.notes.map((n) => ({
+      title: String(n.title || '').slice(0, 140),
+      body: String(n.body || ''),
+      tags: Array.isArray(n.tags) ? n.tags.slice(0, 20) : [],
+      color: n.color || '#6366f1',
+      categoryId: null,
+      pinned: !!n.pinned,
+      favorite: !!n.favorite,
+      archived: !!n.archived,
+      trashed: false
+    }));
+
+    await insertNotes(incoming);
+
+    if (Array.isArray(data.categories) && data.categories.length) {
+      for (const c of data.categories) {
+        if (!c || !c.name) continue;
+        try { await createCategory({ name: String(c.name).slice(0, 60), color: c.color || '#6366f1' }); } catch (e) {}
+      }
+    }
+    return incoming.length;
+  }
+
+  function displayName() {
+    if (state.profile && state.profile.display_name) return state.profile.display_name;
+    if (state.user && state.user.user_metadata && state.user.user_metadata.display_name) return state.user.user_metadata.display_name;
+    if (state.user && state.user.email) return state.user.email.split('@')[0];
+    return 'مستخدم';
+  }
+
+  /* ======================================================================
+     واجهة Store
+     ====================================================================== */
   const Store = {
-    K,
-
     get user() { return state.user; },
-    get secure() { return state.secure; },
+    get session() { return state.session; },
+    get profile() { return state.profile; },
     get notes() { return state.notes; },
     get categories() { return state.categories; },
+    get loading() { return state.loading; },
+    get configured() { return state.configured; },
+    get migrated() { return state.migrated; },
+    get displayName() { return displayName(); },
+    get client() { return sb; },
 
-    /* --- الإقلاع: استعادة جلسة محفوظة إن أمكن --- */
-    async boot() {
-      const session = getSession();
-      if (!session) return null;
-
-      const users = loadUsers();
-      const user = users[session.userId];
-      if (!user) { clearSession(); return null; }
-
-      state.user = user;
-      state.secure = subtleOk();
-
-      if (state.secure) {
-        const remember = safeParse(readLS(K.remember), null);
-        if (remember && remember.userId === user.id && remember.key) {
-          try {
-            state.aesKey = await importAesKey(remember.key);
-          } catch (e) {
-            state.aesKey = null;
+    init() {
+      initClient();
+      if (sb) {
+        // تحديث الجلسة تلقائياً عند تغيّرها
+        sb.auth.onAuthStateChange((event, session) => {
+          state.session = session;
+          if (session && session.user) state.user = session.user;
+          if (event === 'SIGNED_OUT') {
+            state.user = null;
+            state.session = null;
+            state.notes = [];
+            state.categories = [];
           }
-        }
+        });
+      }
+      return !!sb;
+    },
+
+    /** إقلاع التطبيق: يستعيد الجلسة الحالية إن وُجدت */
+    async boot() {
+      if (!sb) return { configured: false, locked: false, user: null };
+
+      const { data, error } = await sb.auth.getSession();
+      if (error || !data.session || !data.session.user) {
+        return { configured: true, locked: false, user: null };
       }
 
-      if (!state.aesKey && state.secure) {
-        // الجلسة محفوظة لكن المفتاح غير متاح — نطلب كلمة المرور
-        state.secure = false;
-        return { locked: true, user: user };
-      }
+      state.user = data.session.user;
+      state.session = data.session;
 
-      await Store.loadData();
-      return { locked: false, user: user };
-    },
-
-    /* --- تسجيل حساب جديد --- */
-    async register({ name, email, password }, remember) {
-      const mail = normalizeEmail(email);
-      if (findUserByEmail(mail)) throw new Error('EMAIL_EXISTS');
-
-      const salt = global.NoteCrypto.makeSalt();
-      const derived = await global.NoteCrypto.derive(password, salt);
-
-      const id = uid('u');
-      const user = {
-        id: id,
-        name: String(name || '').trim() || mail.split('@')[0],
-        email: mail,
-        salt: salt,
-        hash: derived.hash,
-        algo: derived.algo,
-        iterations: derived.iterations,
-        keySalt: global.NoteCrypto.makeSalt(),
-        createdAt: now(),
-        lastLogin: now()
-      };
-
-      const users = loadUsers();
-      users[id] = user;
-      if (!saveUsers(users)) throw new Error('STORAGE_FULL');
-
-      state.user = user;
-      state.secure = subtleOk();
-      if (state.secure) {
-        state.aesKey = await deriveAesKey(password, user.keySalt);
-        if (remember) {
-          writeLS(K.remember, JSON.stringify({ userId: id, key: await exportAesKey(state.aesKey) }));
-        }
-      }
-      state.notes = [];
-      state.categories = [];
-      await Store.loadData();
-      setSession(id, remember);
-      return user;
-    },
-
-    /* --- تسجيل الدخول --- */
-    async login({ email, password }, remember) {
-      const user = findUserByEmail(email);
-      if (!user) throw new Error('NO_USER');
-
-      const derived = await global.NoteCrypto.derive(password, user.salt, user.algo);
-      if (derived.algo !== user.algo) throw new Error('CRYPTO_MISMATCH');
-      if (!global.NoteCrypto.safeEqual(derived.hash, user.hash)) throw new Error('BAD_PASSWORD');
-
-      state.user = user;
-      state.secure = subtleOk();
-      if (state.secure) {
-        state.aesKey = await deriveAesKey(password, user.keySalt);
-        if (remember) {
-          writeLS(K.remember, JSON.stringify({ userId: user.id, key: await exportAesKey(state.aesKey) }));
-        } else {
-          removeLS(K.remember);
-        }
-      }
-
-      user.lastLogin = now();
-      const users = loadUsers();
-      users[user.id] = user;
-      saveUsers(users);
-
-      await Store.loadData();
-      setSession(user.id, remember);
-      return user;
-    },
-
-    /* --- قفل التطبيق: محو المفتاح من الذاكرة --- */
-    async lock() {
-      removeSS(K.session);
-      removeLS(K.session);
-      removeLS(K.remember);
-      state.aesKey = null;
-      state.secure = false;
-      state.notes = [];
-      state.categories = [];
-    },
-
-    logout() { clearSession(); },
-
-    /* --- تحميل/حفظ بيانات المستخدم --- */
-    async loadData() {
-      if (!state.user) return;
-      const uid = state.user.id;
-      const notes = await readPart(uid, 'notes', []);
-      const cats = await readPart(uid, 'categories', []);
-      state.notes = Array.isArray(notes) ? notes : [];
-      state.categories = Array.isArray(cats) ? cats : [];
-    },
-
-    async saveNotes(notes) {
-      state.notes = notes;
-      if (!state.user) return false;
-      return writePart(state.user.id, 'notes', notes);
-    },
-
-    async saveCategories(cats) {
-      state.categories = cats;
-      if (!state.user) return false;
-      return writePart(state.user.id, 'categories', cats);
-    },
-
-    /* --- الإعدادات العامة --- */
-    getSettings() {
-      return Object.assign(
-        { view: 'grid', sort: 'updated' },
-        safeParse(readLS(K.settings), {})
-      );
-    },
-    saveSettings(patch) {
-      const next = Object.assign(Store.getSettings(), patch || {});
-      writeLS(K.settings, JSON.stringify(next));
-      return next;
-    },
-
-    /* --- تصدير / استيراد --- */
-    exportData() {
-      return JSON.stringify({
-        app: 'ملاحظاتي',
-        version: 1,
-        exportedAt: now(),
-        user: { name: state.user.name, email: state.user.email },
-        categories: state.categories,
-        notes: state.notes
-      }, null, 2);
-    },
-
-    async importData(json) {
-      const data = safeParse(json, null);
-      if (!data || !Array.isArray(data.notes)) throw new Error('BAD_FILE');
-      const existing = state.notes;
-      const incoming = data.notes.map((n) => Object.assign({}, n, { id: n.id || uid('n') }));
-      state.notes = existing.concat(incoming);
-      await Store.saveNotes(state.notes);
-      if (Array.isArray(data.categories) && data.categories.length) {
-        state.categories = state.categories.concat(
-          data.categories.map((c) => Object.assign({}, c, { id: c.id || uid('c') }))
-        );
-        await Store.saveCategories(state.categories);
-      }
-      return incoming.length;
-    },
-
-    /* --- تقدير حجم التخزين --- */
-    usageBytes() {
-      let total = 0;
       try {
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && key.startsWith(NS)) total += key.length + (localStorage.getItem(key) || '').length;
-        }
-      } catch (e) {}
-      return total * 2; // تقدير UTF-16
+        await loadData();
+      } catch (e) {
+        // الجداول غير موجودة بعد → نُبلغ الواجهة بدل الفشل الصامت
+        return { configured: true, locked: false, user: state.user, error: e, noTables: e.reason === 'NO_TABLES' };
+      }
+      return { configured: true, locked: false, user: state.user };
     },
 
-    /* --- حذف حساب المستخدم وكل بياناته --- */
-    async deleteAccount(password) {
-      const user = state.user;
-      if (!user) throw new Error('NO_USER');
-      const derived = await global.NoteCrypto.derive(password, user.salt, user.algo);
-      if (!global.NoteCrypto.safeEqual(derived.hash, user.hash)) throw new Error('BAD_PASSWORD');
+    register,
+    login,
+    logout,
+    lock,
+    resendConfirmation,
 
-      removeLS(K.user(user.id, 'notes'));
-      removeLS(K.user(user.id, 'categories'));
-      const users = loadUsers();
-      delete users[user.id];
-      saveUsers(users);
-      clearSession();
-      return true;
-    },
+    loadData,
+    createNote,
+    updateNote,
+    deleteNote,
+    insertNotes,
+    createCategory,
+    updateCategory,
+    deleteCategory,
+    updateProfile,
 
-    /* --- مساعدات --- */
-    newId: uid,
-    now
+    getSettings,
+    saveSettings,
+    exportData,
+    importData,
+
+    translateError,
+    now: nowISO,
+    newId: function () { return 'tmp_' + Math.random().toString(36).slice(2); }
   };
 
   global.Store = Store;
